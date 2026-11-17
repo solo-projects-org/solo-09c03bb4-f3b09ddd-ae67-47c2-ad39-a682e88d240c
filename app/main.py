@@ -1,4 +1,9 @@
-"""FastAPI 应用：上传、锁定/解锁、求解作业、确认、下载。"""
+"""FastAPI 应用：上传、锁定/解锁、求解作业、确认、下载。
+
+所有会改变「可确认性」的状态变更（核实值、方案发布、确认）都在数据库层
+以单个 IMMEDIATE 事务完成；查询接口使用一致快照。后台求解是单线程池，
+作业在取输入和发布结果时分别核对修订号与作业状态。
+"""
 from __future__ import annotations
 
 import csv
@@ -38,11 +43,17 @@ def _pool() -> ThreadPoolExecutor:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _job_pool
-    _job_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="solver")
-    db.init_db()
-    yield
-    _job_pool.shutdown(wait=False)
-    _job_pool = None
+    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="solver")
+    _job_pool = pool
+    db.init_db()  # 建库 + 重启恢复（未完成作业作废）
+    try:
+        yield
+    finally:
+        # 优雅停机：等待本实例的求解线程结束，避免其继续使用数据库（测试中
+        # 还会切换数据库路径）。已排队作业若在停机期间发布，仍走完整校验。
+        pool.shutdown(wait=True)
+        if _job_pool is pool:  # 嵌套的应用实例不得清掉别人的池
+            _job_pool = None
 
 
 app = FastAPI(title="育种巡检数据修复", version="1.0.0", lifespan=lifespan)
@@ -84,8 +95,10 @@ async def create_session(
 
     rows = [r.__dict__ for r in parsed_rows]
     sid = db.create_session(rows, pairs)
-    revision = db.current_revision(sid)
-    job_id = db.create_job(sid, revision)
+    created = db.create_job(sid)
+    if created is None:  # 提交后会话被删除（当前 API 无删除路径，防御性处理）
+        raise HTTPException(status_code=500, detail="无法创建求解作业。")
+    job_id, revision = created
     _pool().submit(_run_job, sid, job_id, revision)
     return JSONResponse(
         status_code=201,
@@ -96,18 +109,23 @@ async def create_session(
 # ---------------------------------------------------------------- 会话详情
 @app.get("/api/sessions/{sid}")
 def session_detail(sid: int) -> dict:
-    data = db.get_session(sid)
+    data = db.get_session(sid)  # 单次一致快照
     if data is None:
         raise HTTPException(status_code=404, detail="会话不存在。")
-    return _serialize_session(sid, data)
+    return _serialize_session(data)
 
 
-def _serialize_session(sid: int, data: dict) -> dict:
+def _serialize_session(data: dict) -> dict:
+    sid = data["session"]["id"]
     s, rows, pairs = data["session"], data["rows"], data["pairs"]
     locks = {(l["row_id"], l["field"]): l for l in data["locks"]}
-    solution = db.get_solution(sid)
-    confirmation = db.get_confirmation(sid)
+    solution = data["solution"]
     current_rev = s["revision"]
+
+    # 同一快照内的可确认性判断（含修订号、完整方案、核实值快照、确认）。
+    issue = db.solution_issue(data)
+    download_issue = db.solution_issue(data, require_confirmation=True)
+    stale = issue in ("stale", "locks_changed", "solution_mismatch")
 
     cells = []
     conflicts_out: List[dict] = []
@@ -117,21 +135,21 @@ def _serialize_session(sid: int, data: dict) -> dict:
     total_changes = None
     optimal = False
     objective_proven = False
-    stale = True
 
     if solution is not None:
         sol_status = solution["status"]
         sol_revision = solution["revision"]
-        stale = sol_revision != current_rev
         optimal = bool(solution["optimal"])
         objective_proven = bool(solution["objective_proven"])
         total_changes = solution["total_changes"]
         groups = solution["payload"].get("groups", [])
-        for c in solution["payload"]["cells"]:
+        for c in solution["payload"].get("cells", []):
             cell = dict(c)
             cell["field"] = cell.pop("fld")
-            lk = locks.get((c["row_id"], c["fld"]))
-            if lk is not None:  # 锁可能在方案生成后变化，以当前锁为准展示
+            # 仅当方案与当前核实值属于同一修订号时，才用当前锁覆盖展示；
+            # 过期方案保持自身生成时的快照，避免把旧方案伪装成新锁的结果。
+            lk = locks.get((cell["row_id"], cell["field"]))
+            if lk is not None and not stale:
                 cell["locked"] = True
                 cell["locked_value"] = lk["value"]
                 cell["lock_source"] = lk["source"]
@@ -139,15 +157,7 @@ def _serialize_session(sid: int, data: dict) -> dict:
             cells.append(cell)
         conflicts_out = solution["conflicts"]
 
-    confirmed = (
-        confirmation is not None
-        and not stale
-        and solution is not None
-        and confirmation["solution_id"] == solution["id"]
-        and sol_status == "optimal"
-        and objective_proven
-    )
-
+    job = data["job"]
     return {
         "id": sid,
         "revision": current_rev,
@@ -156,14 +166,23 @@ def _serialize_session(sid: int, data: dict) -> dict:
         "house_count": len({h for _, h in pairs}),
         "created_at": s["created_at"],
         "locked_count": len(locks),
-        "job_status": data["job"]["status"] if data["job"] else None,
-        "job_id": data["job"]["id"] if data["job"] else None,
+        "job_status": job["status"] if job else None,
+        "job_id": job["id"] if job else None,
         "solution_status": sol_status,
+        "solution_revision": sol_revision,
         "solution_stale": stale,
         "total_changes": total_changes,
         "optimal": optimal,
         "objective_proven": objective_proven,
-        "confirmed": confirmed,
+        "confirmed": download_issue is None,
+        "confirm_block_reason": (
+            None if issue is None else db.ISSUE_MESSAGES.get(issue, issue)
+        ),
+        "download_block_reason": (
+            None
+            if download_issue is None
+            else db.ISSUE_MESSAGES.get(download_issue, download_issue)
+        ),
         "rows": [
             {
                 "row_id": r["row_id"],
@@ -187,30 +206,29 @@ def _serialize_session(sid: int, data: dict) -> dict:
 # ---------------------------------------------------------------- 锁定/解锁
 @app.post("/api/sessions/{sid}/locks")
 def add_lock(sid: int, body: LockIn) -> dict:
-    data = db.get_session(sid)
-    if data is None:
+    # 校验与写入在同一个事务内完成：校验通过时锁定必然生效，失败时不改任何状态。
+    code, revision = db.apply_lock(
+        sid, body.row_id, body.field, body.value, body.source
+    )
+    if code == "no_session":
         raise HTTPException(status_code=404, detail="会话不存在。")
-    row = next((r for r in data["rows"] if r["row_id"] == body.row_id), None)
-    if row is None:
+    if code == "row_missing":
         raise HTTPException(status_code=400, detail="row_id 不存在。")
-    if body.source == "original":
-        expected = row[body.field]
-        if body.value != expected:
-            raise HTTPException(
-                status_code=400,
-                detail=f"原值锁定的值必须等于原表值「{expected}」。",
-            )
-    else:
-        varieties = {v for v, _ in data["pairs"]}
-        houses = {h for _, h in data["pairs"]}
-        domain = varieties if body.field == "variety" else houses
-        if body.value not in domain:
-            raise HTTPException(
-                status_code=400,
-                detail=f"候选值「{body.value}」不在允许取值域内。",
-            )
-    db.upsert_lock(sid, body.row_id, body.field, body.value, body.source)
-    revision = db.bump_revision(sid)
+    if code == "original_mismatch":
+        row = next(
+            r
+            for r in db.get_session(sid)["rows"]
+            if r["row_id"] == body.row_id
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=f"原值锁定的值必须等于原表值「{row[body.field]}」。",
+        )
+    if code == "out_of_domain":
+        raise HTTPException(
+            status_code=400,
+            detail=f"候选值「{body.value}」不在允许取值域内。",
+        )
     return {"revision": revision, "locked": True}
 
 
@@ -218,23 +236,22 @@ def add_lock(sid: int, body: LockIn) -> dict:
 def remove_lock(sid: int, row_id: int, field: str) -> dict:
     if field not in ("variety", "house"):
         raise HTTPException(status_code=400, detail="field 必须是 variety 或 house。")
-    if db.get_session(sid) is None:
+    outcome = db.delete_lock_and_bump(sid, row_id, field)
+    if outcome is None:
         raise HTTPException(status_code=404, detail="会话不存在。")
-    removed = db.delete_lock(sid, row_id, field)
+    removed, revision = outcome
     if not removed:
         raise HTTPException(status_code=404, detail="该核实值不存在。")
-    revision = db.bump_revision(sid)
     return {"revision": revision, "locked": False}
 
 
 # ---------------------------------------------------------------- 触发求解
 @app.post("/api/sessions/{sid}/solve")
 def trigger_solve(sid: int) -> dict:
-    data = db.get_session(sid)
-    if data is None:
+    created = db.create_job(sid)
+    if created is None:
         raise HTTPException(status_code=404, detail="会话不存在。")
-    revision = data["session"]["revision"]
-    job_id = db.create_job(sid, revision)
+    job_id, revision = created
     _pool().submit(_run_job, sid, job_id, revision)
     return {"job_id": job_id, "revision": revision}
 
@@ -253,49 +270,38 @@ def confirm_solution(sid: int) -> dict:
     data = db.get_session(sid)
     if data is None:
         raise HTTPException(status_code=404, detail="会话不存在。")
-    solution = db.get_solution(sid)
+    solution = data["solution"]
     if solution is None:
-        raise HTTPException(status_code=409, detail="尚无方案，无法确认。")
-    current_rev = data["session"]["revision"]
-    if solution["revision"] != current_rev:
+        raise HTTPException(status_code=409, detail=db.ISSUE_MESSAGES["no_solution"])
+    # 用快照中的方案 id 作为期望值，事务内若方案已被替换则拒绝，避免确认到
+    # 另一个版本/另一份方案的「半次确认」。
+    issue = db.confirm_solution(sid, solution["id"])
+    if issue is not None:
+        status = 404 if issue == "no_session" else 409
         raise HTTPException(
-            status_code=409,
-            detail="方案基于旧版本（核实值已变化），请重新求解后再确认。",
+            status_code=status, detail=db.ISSUE_MESSAGES.get(issue, issue)
         )
-    if solution["status"] == "infeasible":
-        raise HTTPException(
-            status_code=409,
-            detail="当前核实值下无解，不存在可确认的修复方案。",
-        )
-    if solution["status"] != "optimal" or not solution["objective_proven"]:
-        raise HTTPException(
-            status_code=409,
-            detail="未证明最优的方案不可确认，请重新求解。",
-        )
-    db.add_confirmation(sid, solution["id"], current_rev)
-    return {"confirmed": True, "revision": current_rev}
+    confirmed = db.get_session(sid)
+    return {
+        "confirmed": True,
+        "revision": confirmed["session"]["revision"],
+        "solution_id": solution["id"],
+    }
 
 
 # ---------------------------------------------------------------- 下载修复 CSV
 @app.get("/api/sessions/{sid}/download")
 def download_csv(sid: int) -> Response:
-    data = db.get_session(sid)
+    data = db.get_session(sid)  # 原表、方案、确认、核实值来自同一快照
     if data is None:
         raise HTTPException(status_code=404, detail="会话不存在。")
-    confirmation = db.get_confirmation(sid)
-    solution = db.get_solution(sid)
-    if confirmation is None or solution is None:
-        raise HTTPException(status_code=409, detail="方案尚未确认，无法下载。")
-    current_rev = data["session"]["revision"]
-    if (
-        confirmation["revision"] != current_rev
-        or confirmation["solution_id"] != solution["id"]
-        or not solution["objective_proven"]
-    ):
+    issue = db.solution_issue(data, require_confirmation=True)
+    if issue is not None:
         raise HTTPException(
-            status_code=409, detail="确认已失效，请重新求解并确认后再下载。"
+            status_code=409, detail=db.ISSUE_MESSAGES.get(issue, issue)
         )
 
+    solution = data["solution"]
     cells = {
         (c["row_id"], c["fld"]): c["proposed"]
         for c in solution["payload"]["cells"]
@@ -328,17 +334,14 @@ def download_csv(sid: int) -> Response:
 # ---------------------------------------------------------------- 后台作业
 def _run_job(sid: int, job_id: int, revision: int) -> None:
     """后台求解。迟到结果（版本已变/作业被取代）直接丢弃，绝不替换新方案。"""
-    if db.current_revision(sid) != revision:
-        db.mark_job(job_id, "superseded")
+    # 原子认领：仅本会话、本修订、仍为 pending 的作业可以开始。
+    if not db.start_job(job_id, sid, revision):
         return
-    db.mark_job(job_id, "running")
     try:
-        data = db.get_session(sid)
-        if data is None:
-            db.mark_job(job_id, "error", "会话不存在。")
-            return
-        if data["session"]["revision"] != revision:
-            db.mark_job(job_id, "superseded")
+        # 同一快照读取修订号、原表、允许组合与完整核实值。
+        run_input = db.get_run_input(sid, job_id, revision)
+        if run_input is None:
+            db.finish_job(job_id, "superseded")
             return
         locks = [
             LockSpec(
@@ -347,19 +350,14 @@ def _run_job(sid: int, job_id: int, revision: int) -> None:
                 value=l["value"],
                 source=l["source"],
             )
-            for l in data["locks"]
+            for l in run_input["locks"]
         ]
-        result = solve(data["rows"], data["pairs"], locks)
-        # 迟到结果保护：写入前再次核对版本与作业状态。
-        latest = db.get_job(job_id)
-        if (
-            db.current_revision(sid) != revision
-            or latest is None
-            or latest["status"] == "superseded"
-        ):
-            db.mark_job(job_id, "superseded")
-            return
-        db.save_solution(sid, job_id, revision, result)
-        db.mark_job(job_id, "done")
-    except Exception as exc:  # 失败保留原表与核实值
-        db.mark_job(job_id, "error", str(exc))
+        result = solve(run_input["rows"], run_input["pairs"], locks)
+        # 发布前在写事务中再次核对修订号与作业状态；失败则整笔回滚。
+        published = db.publish_solution(
+            sid, job_id, revision, run_input["locks"], result
+        )
+        if not published:
+            db.finish_job(job_id, "superseded")
+    except Exception as exc:  # 失败保留原表与核实值，作业标记错误
+        db.finish_job(job_id, "error", str(exc))

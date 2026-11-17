@@ -157,6 +157,8 @@ const CAT_TEXT = {
 let pairs = [];
 let session = null;
 let pollTimer = null;
+// 仅用于同一会话内的响应乱序保护；切换会话时必须重置，否则新会话（rev 1）
+// 会被上一会话的修订号挡住而永不渲染。
 let lastSeenRevision = 0;
 
 const $ = (id) => document.getElementById(id);
@@ -220,10 +222,14 @@ async function loadSession(sid) {
   const r = await fetch(`/api/sessions/${sid}`);
   if (!r.ok) { alert("加载会话失败"); return; }
   const data = await r.json();
-  // 迟到结果保护：若期间已看到更新的 revision，则不渲染旧响应。
-  if (session && data.id === session.id && data.revision < lastSeenRevision) return;
+  // 迟到结果保护：仅对同一会话比较修订号；切换会话后按新会话重置。
+  if (session && data.id !== session.id) {
+    lastSeenRevision = 0;
+  } else if (session && data.revision < lastSeenRevision) {
+    return;
+  }
   session = data;
-  lastSeenRevision = Math.max(lastSeenRevision, data.revision);
+  lastSeenRevision = data.revision;
   renderSession();
 }
 
@@ -252,12 +258,15 @@ function renderSession() {
   renderTable();
   renderConflicts();
 
-  const canConfirm = !stale && !running && d.solution_status === "optimal" && d.objective_proven && !d.confirmed;
+  const canConfirm =
+    !d.confirm_block_reason && !d.confirmed && !running;
   $("confirmBtn").disabled = !canConfirm;
-  $("downloadBtn").disabled = !d.confirmed || stale;
+  $("downloadBtn").disabled = !!d.download_block_reason;
   $("solveHint").textContent = running
     ? "求解进行中，期间仍可修改核实值；迟到的旧结果不会替换新方案。"
-    : (stale ? "方案已过期：锁定变化已立即禁止确认旧方案，请重新求解。" : "");
+    : (stale
+        ? "方案已过期：锁定变化已立即禁止确认旧方案，请重新求解。"
+        : (d.confirm_block_reason || d.download_block_reason || ""));
 }
 
 function renderTable() {
@@ -326,7 +335,6 @@ function renderConflicts() {
 
 async function handleCellAction(el) {
   const act = el.dataset.act, rowId = Number(el.dataset.row), field = el.dataset.field;
-  const cell = session.cells.find(c => c.row_id === rowId && c.field === field);
   const row = session.rows.find(r => r.row_id === rowId);
   try {
     if (act === "unlock") {
@@ -340,10 +348,16 @@ async function handleCellAction(el) {
       if (!value) return;
       await postLock(rowId, field, value, "candidate");
     }
-    stopPolling();
-    await loadSession(session.id);
   } catch (e) {
     showAlert($("sessionAlert"), e.message);
+  } finally {
+    // 无论成功与否都重新拉取：失败（如并发下锁已变化）时页面必须回到服务端的
+    // 真实核实值/方案状态，不能停留在半次锁定的旧界面。
+    stopPolling();
+    await loadSession(session.id);
+    if (session && (session.job_status === "pending" || session.job_status === "running")) {
+      startPolling(session.id);
+    }
   }
 }
 
@@ -367,12 +381,38 @@ $("recalcBtn").onclick = async () => {
 
 $("confirmBtn").onclick = async () => {
   const r = await fetch(`/api/sessions/${session.id}/confirm`, { method: "POST" });
-  if (!r.ok) { showAlert($("sessionAlert"), (await r.json()).detail); return; }
+  if (!r.ok) {
+    // 确认被拒绝（方案过期/已被替换/已确认）：提示后刷新为服务端真实状态，
+    // 避免按钮与页面状态停留在「似乎已确认」的中间态。
+    showAlert($("sessionAlert"), (await r.json()).detail);
+    await loadSession(session.id);
+    return;
+  }
   await loadSession(session.id);
 };
 
-$("downloadBtn").onclick = () => {
-  window.location.href = `/api/sessions/${session.id}/download`;
+$("downloadBtn").onclick = async () => {
+  // 下载前先核对服务端状态：若核实值已变化/确认已失效，展示原因而不是
+  // 让浏览器下载一个与本页状态不一致的文件或裸 JSON 错误页。
+  const r = await fetch(`/api/sessions/${session.id}/download`);
+  if (!r.ok) {
+    let msg = "下载失败";
+    try { msg = (await r.json()).detail || msg; } catch (_) { /* 非 JSON 响应 */ }
+    showAlert($("sessionAlert"), msg);
+    await loadSession(session.id);
+    return;
+  }
+  const blob = await r.blob();
+  const disp = r.headers.get("Content-Disposition") || "";
+  const m = disp.match(/filename="([^"]+)"/);
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = m ? m[1] : `repaired_session_${session.id}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 };
 
 // ---------- 轮询（迟到响应不替换新方案由后端版本控制 + 前端 revision 保护） ----------

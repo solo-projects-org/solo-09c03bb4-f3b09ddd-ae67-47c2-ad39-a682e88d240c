@@ -22,12 +22,26 @@ let state = {
   groups: [],
 };
 function sessionBody() {
+  // 与后端一致：拒绝原因由服务端按同一快照计算后下发。
+  const confirmReason = state.confirmed
+    ? "方案已确认。"
+    : (state.solution_stale
+        ? "方案基于旧版本（核实值已变化），请重新求解后再确认。"
+        : (state.solution_status !== "optimal" || !state.objective_proven
+            ? "未证明最优的方案不可确认，请重新求解。" : null));
+  const downloadReason = state.confirmed && !state.solution_stale &&
+      state.solution_status === "optimal" && state.objective_proven
+    ? null
+    : "方案尚未确认，无法下载。";
   return {
     id: 1, revision: state.revision, row_count: 2, variety_count: 2, house_count: 2,
     created_at: "t", locked_count: state.lockedCount, job_status: state.job_status,
-    job_id: 1, solution_status: state.solution_status, solution_stale: state.solution_stale,
+    job_id: 1, solution_status: state.solution_status, solution_revision: state.revision,
+    solution_stale: state.solution_stale,
     total_changes: state.total_changes, optimal: state.optimal,
     objective_proven: state.objective_proven, confirmed: state.confirmed,
+    confirm_block_reason: confirmReason,
+    download_block_reason: downloadReason,
     rows: [
       { row_id: 1, line_no: "1", plant_no: "P1", tray_no: "T1", variety_original: "V1", house_original: "H1", height: "10" },
       { row_id: 2, line_no: "2", plant_no: "P1", tray_no: "T2", variety_original: "V2", house_original: "H1", height: "11" },
@@ -60,6 +74,15 @@ window.fetch = async (url, opts = {}) => {
   if (url.endsWith("/solve") && method === "POST") {
     state.solution_stale = false;
     return { ok: true, status: 200, json: async () => ({ job_id: 2, revision: state.revision }) };
+  }
+  if (url.endsWith("/download")) {
+    if (!state.confirmed || state.solution_stale)
+      return { ok: false, status: 409, json: async () => ({ detail: "确认已失效，请重新求解并确认后再下载。" }) };
+    return {
+      ok: true, status: 200,
+      headers: { get: () => 'attachment; filename="repaired_session_1.csv"' },
+      blob: async () => new window.Blob(["csv"], { type: "text/csv" }),
+    };
   }
   if (url.endsWith("/confirm") && method === "POST") {
     if (state.solution_stale || !state.objective_proven)
